@@ -22,38 +22,51 @@ function aiCacheKey(q){return crypto.createHash('sha256').update(String(q).norma
 function trimAiCache(){const now=Date.now();for(const [k,v] of aiAnswerCache){if(v.expiresAt<=now)aiAnswerCache.delete(k)}while(aiAnswerCache.size>AI_CACHE_MAX){const first=aiAnswerCache.keys().next().value;if(first===undefined)break;aiAnswerCache.delete(first)}}
 async function ai(q){const question=String(q).trim();if(!question)throw new Error('कृपया अपना सवाल लिखें।');trimAiCache();const cacheKey=aiCacheKey(question),cached=aiAnswerCache.get(cacheKey);if(cached&&cached.expiresAt>Date.now()){aiAnswerCache.delete(cacheKey);aiAnswerCache.set(cacheKey,cached);return cached.answer}if(aiInFlight.has(cacheKey))return aiInFlight.get(cacheKey);const task=aiUncached(question).then(answer=>{aiAnswerCache.set(cacheKey,{answer,expiresAt:Date.now()+AI_CACHE_TTL_MS});trimAiCache();return answer}).finally(()=>aiInFlight.delete(cacheKey));aiInFlight.set(cacheKey,task);return task}
 async function aiUncached(q){
- const key=String(process.env.OPENAI_API_KEY||'').trim();
- if(!key)throw new Error('AI सेवा configure नहीं है। Render Environment में OPENAI_API_KEY डालें।');
- const model=String(process.env.OPENAI_MODEL||'gpt-4.1-mini').trim();
+ const geminiKey=String(process.env.GEMINI_API_KEY||'').trim();
+ const openaiKey=String(process.env.OPENAI_API_KEY||'').trim();
+ const provider=String(process.env.AI_PROVIDER||(geminiKey?'gemini':'openai')).trim().toLowerCase();
  const systemText='You are Nirvix Ai AI assistant. Answer construction, civil engineering, house planning, material, RCC, room, transportation and general questions clearly. Reply in the language used by the user. For structural safety, advise verification by a qualified engineer.';
  let r,j;
+ if(provider==='gemini'){
+  if(!geminiKey)throw new Error('Gemini API key configure नहीं है। Server Environment में GEMINI_API_KEY डालें।');
+  const model=String(process.env.GEMINI_MODEL||'gemini-2.5-flash').trim();
+  try{
+   r=await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(model)+':generateContent?key='+encodeURIComponent(geminiKey),{
+    method:'POST',headers:{'Content-Type':'application/json'},signal:AbortSignal.timeout(30000),
+    body:JSON.stringify({systemInstruction:{parts:[{text:systemText}]},contents:[{role:'user',parts:[{text:String(q)}]}],generationConfig:{maxOutputTokens:2048,temperature:0.5}})
+   });
+   j=await r.json().catch(()=>({}));
+  }catch(e){console.error('Gemini request connection error:',e&&e.message?e.message:e);throw new Error('Gemini AI से कनेक्शन नहीं हो पाया। Server और network logs जाँचें।')}
+  if(!r.ok){
+   const msg=String(j?.error?.message||'').trim();console.error('Gemini API error:',r.status,msg);
+   if(r.status===400)throw new Error('Gemini request स्वीकार नहीं हुई। API key और model settings जाँचें।');
+   if(r.status===401||r.status===403)throw new Error('Gemini API key गलत है या API access अनुमति नहीं है। Google AI Studio में key और API access जाँचें।');
+   if(r.status===429)throw new Error('Gemini API की quota या rate limit पूरी है। Google AI Studio में usage/quota जाँचें।');
+   throw new Error(msg||('Gemini API request failed ('+r.status+').'));
+  }
+  const answer=String(j?.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('\n')||'').trim();
+  if(!answer)throw new Error('Gemini से खाली जवाब मिला। कृपया सवाल बदलकर दोबारा पूछें।');
+  return answer;
+ }
+ if(!openaiKey)throw new Error('AI सेवा configure नहीं है। Server Environment में GEMINI_API_KEY या OPENAI_API_KEY डालें।');
+ const model=String(process.env.OPENAI_MODEL||'gpt-4.1-mini').trim();
  try{
   r=await fetch('https://api.openai.com/v1/chat/completions',{
-   method:'POST',
-   headers:{'Content-Type':'application/json','Authorization':'Bearer '+key},
+   method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+openaiKey},
    signal:AbortSignal.timeout(30000),
    body:JSON.stringify({model,messages:[{role:'system',content:systemText},{role:'user',content:String(q)}],max_tokens:2048})
   });
   j=await r.json().catch(()=>({}));
- }catch(e){
-  console.error('OpenAI request connection error:',e&&e.message?e.message:e);
-  throw new Error('OpenAI से कनेक्शन नहीं हो पाया। Render server और network logs जाँचकर दोबारा कोशिश करें।');
- }
+ }catch(e){console.error('OpenAI request connection error:',e&&e.message?e.message:e);throw new Error('OpenAI से कनेक्शन नहीं हो पाया। Server और network logs जाँचें।')}
  if(!r.ok){
-  const apiMessage=String(j?.error?.message||'').trim();
-  const errorCode=String(j?.error?.code||'').toLowerCase();
-  const errorType=String(j?.error?.type||'').toLowerCase();
-  console.error('OpenAI API error:',r.status,errorCode||errorType,apiMessage);
-  if(r.status===401)throw new Error('OPENAI_API_KEY गलत, inactive या revoke की गई है। Render Environment में key जाँचें।');
-  if(r.status===429){
-   if(errorCode.includes('insufficient_quota')||errorType.includes('insufficient_quota')||/quota|billing|credits/i.test(apiMessage))
-    throw new Error('OpenAI API की उपलब्ध billing/credits quota पूरी है। OpenAI Platform में Billing और Usage जाँचें।');
-   throw new Error('OpenAI API rate limit लगी है। थोड़ी देर बाद दोबारा कोशिश करें।');
-  }
-  if(r.status===400)throw new Error('OpenAI request स्वीकार नहीं हुई: '+(apiMessage||'model या request settings जाँचें।'));
+  const msg=String(j?.error?.message||'').trim(),code=String(j?.error?.code||'').toLowerCase(),type=String(j?.error?.type||'').toLowerCase();
+  console.error('OpenAI API error:',r.status,code||type,msg);
+  if(r.status===401)throw new Error('OPENAI_API_KEY गलत, inactive या revoke की गई है। Server Environment में key जाँचें।');
+  if(r.status===429){if(code.includes('insufficient_quota')||type.includes('insufficient_quota')||/quota|billing|credits/i.test(msg))throw new Error('OpenAI API की billing/credits quota पूरी है। OpenAI Platform में Billing और Usage जाँचें।');throw new Error('OpenAI API rate limit लगी है। थोड़ी देर बाद कोशिश करें।')}
+  if(r.status===400)throw new Error('OpenAI request स्वीकार नहीं हुई: '+(msg||'model या request settings जाँचें।'));
   if(r.status===403)throw new Error('OpenAI API access अनुमति नहीं मिली। Project, model access और API key permissions जाँचें।');
-  if(r.status===404)throw new Error('OpenAI endpoint या model नहीं मिला। Render में OPENAI_MODEL को gpt-4.1-mini जाँचें।');
-  throw new Error(apiMessage||('OpenAI API request failed ('+r.status+').'));
+  if(r.status===404)throw new Error('OpenAI endpoint या model नहीं मिला। OPENAI_MODEL जाँचें।');
+  throw new Error(msg||('OpenAI API request failed ('+r.status+').'));
  }
  const answer=String(j?.choices?.[0]?.message?.content||'').trim();
  if(!answer)throw new Error('OpenAI से खाली जवाब मिला। कृपया सवाल बदलकर दोबारा पूछें।');
@@ -61,7 +74,7 @@ async function aiUncached(q){
 }
 
 const server=http.createServer(async(req,res)=>{try{const u=url.parse(req.url,true),p=u.pathname;if(req.method==='OPTIONS')return json(res,204,{});
-if(p==='/api/health')return json(res,200,{ok:true,service:'Nirvix Ai V6',aiConfigured:Boolean(String(process.env.OPENAI_API_KEY||'').trim()),aiModel:process.env.OPENAI_MODEL||'gpt-4.1-mini',databaseConfigured:Boolean(pgPool),databaseReady:pgReady,time:new Date().toISOString()});
+if(p==='/api/health')return json(res,200,{ok:true,service:'Nirvix Ai V6',aiConfigured:(String(process.env.AI_PROVIDER||(process.env.GEMINI_API_KEY?'gemini':'openai')).trim().toLowerCase()==='gemini'?Boolean(String(process.env.GEMINI_API_KEY||'').trim()):Boolean(String(process.env.OPENAI_API_KEY||'').trim())),aiProvider:process.env.AI_PROVIDER||(process.env.GEMINI_API_KEY?'gemini':'openai'),aiModel:String(process.env.AI_PROVIDER||(process.env.GEMINI_API_KEY?'gemini':'openai')).trim().toLowerCase()==='gemini'?(process.env.GEMINI_MODEL||'gemini-2.5-flash'):(process.env.OPENAI_MODEL||'gpt-4.1-mini'),databaseConfigured:Boolean(pgPool),databaseReady:pgReady,time:new Date().toISOString()});
 if(p==='/api/auth/register'&&req.method==='POST'){const x=await body(req),role=['Customer','Seller','Provider'].includes(x.role)?x.role:'Customer',mobile=String(x.mobile||'').replace(/\D/g,''),email=String(x.email||'').trim().toLowerCase(),address=String(x.address||'').trim(),pincode=String(x.pincode||'').replace(/\D/g,'');if(String(x.name||'').trim().length<2||!/^[0-9]{10}$/.test(mobile)||!address)return json(res,400,{error:'Name, valid 10-digit mobile and full address required.'});if(email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return json(res,400,{error:'Valid email ID डालें।'});if(pincode&&!/^[0-9]{6}$/.test(pincode))return json(res,400,{error:'PIN code must be 6 digits.'});if(!email&&!mobile)return json(res,400,{error:'Mobile or email is required.'});if(db.users.some(a=>a.mobile===mobile))return json(res,409,{error:'यह mobile number पहले से registered है। उसी role और password से login करें; दुबारा registration नहीं हो सकता।'});if(!/^\d{4}$/.test(String(x.password||'')))return json(res,400,{error:'4 अंकों का password जरूरी है।'});if(email&&db.users.some(a=>String(a.email||'').toLowerCase()===email&&a.role===role))return json(res,409,{error:'This email is already registered for this role.'});const referred=String(x.referralCode||'').trim().toUpperCase();const referrer=referred?db.users.find(a=>String(a.referralCode||'').toUpperCase()===referred):null;if(referred&&!referrer)return json(res,400,{error:'Referral ID नहीं मिला। सही Referral ID डालें या खाली छोड़ें।'});const u={id:db.next.user++,name:String(x.name).trim(),mobile,email,place:String(x.place||''),address,pincode,latitude:x.latitude?Number(x.latitude):null,longitude:x.longitude?Number(x.longitude):null,role,password:hash(String(x.password)),referralCode:'CSZ'+crypto.randomBytes(4).toString('hex').toUpperCase(),referredBy:referrer?referrer.referralCode:'',rewardCoupons:[],createdAt:new Date().toISOString()};db.users.push(u);if(referrer){referrer.rewardCoupons=Array.isArray(referrer.rewardCoupons)?referrer.rewardCoupons:[];referrer.rewardCoupons.push({code:'CSZ-'+crypto.randomBytes(3).toString('hex').toUpperCase(),reason:'Referral registration',createdAt:new Date().toISOString()})}const t=token();db.sessions.push({token:t,userId:u.id,createdAt:new Date().toISOString()});save();return json(res,200,{token:t,user:safe(u)})}
 if(p==='/api/auth/login'&&req.method==='POST'){const x=await body(req),identifier=String(x.identifier||x.mobile||x.email||'').trim(),email=identifier.toLowerCase(),mobile=identifier.replace(/\D/g,''),byEmail=x.loginBy==='email'||identifier.includes('@');if(!identifier)return json(res,400,{error:'Registered mobile number or email is required.'});const matches=db.users.filter(a=>byEmail?String(a.email||'').trim().toLowerCase()===email:a.mobile===mobile);const requestedRole=['Customer','Seller','Provider'].includes(x.role)?x.role:'';if(!requestedRole)return json(res,400,{error:'Login के लिए Customer, Seller या Provider में से सही role चुनें।'});const u=matches.find(a=>a.role===requestedRole);if(!u){if(matches.length)return json(res,401,{error:'यह mobile/email दूसरे role में registered है ('+[...new Set(matches.map(a=>a.role))].join(', ')+')। उसी role को चुनें जिसमें registration किया था।'});return json(res,401,{error:byEmail?'इस Email/Gmail पर account नहीं मिला। Registration में इस्तेमाल किया गया सही Email ID डालें।':'इस mobile number पर account नहीं मिला। Registration वाला सही mobile number डालें।'});}if(!u.password||!verify(String(x.password||''),u.password))return json(res,401,{error:'गलत 4 अंकों का password। Registration वाला वही password डालें।'});const t=token();db.sessions.push({token:t,userId:u.id,createdAt:new Date().toISOString()});save();return json(res,200,{token:t,user:safe(u)})}
 if(p==='/api/auth/admin'&&req.method==='POST'){const x=await body(req);const key=process.env.ADMIN_KEY||process.env.OWNER_KEY;if(!key)return json(res,503,{error:'Admin login disabled: set ADMIN_KEY (or existing OWNER_KEY) in Render Environment first.'});if(String(x.key||'')!==key)return json(res,401,{error:'Invalid owner key'});let u=db.users.find(a=>a.role==='Admin');if(!u){u={id:db.next.user++,name:'Ranjan Kumar',mobile:'',role:'Admin',password:hash(crypto.randomUUID()),createdAt:new Date().toISOString()};db.users.push(u)}const t=token();db.sessions.push({token:t,userId:u.id,createdAt:new Date().toISOString()});save();return json(res,200,{token:t,user:safe(u)})}
